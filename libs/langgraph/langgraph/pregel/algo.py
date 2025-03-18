@@ -19,7 +19,6 @@ from typing import (
     cast,
     overload,
 )
-from uuid import UUID
 
 from langchain_core.callbacks import Callbacks
 from langchain_core.callbacks.manager import AsyncParentRunManager, ParentRunManager
@@ -28,6 +27,7 @@ from langchain_core.runnables.config import RunnableConfig
 from langgraph.channels.base import BaseChannel
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
+    ChannelVersions,
     Checkpoint,
     PendingWrite,
     V,
@@ -434,7 +434,7 @@ def prepare_single_task(
 ) -> Union[None, PregelTask, PregelExecutableTask]:
     """Prepares a single task for the next Pregel step, given a task path, which
     uniquely identifies a PUSH or PULL task within the graph."""
-    checkpoint_id = UUID(checkpoint["id"]).bytes
+    checkpoint_id = checkpoint["id"].encode()
     configurable = config.get(CONF, {})
     parent_ns = configurable.get(CONFIG_KEY_CHECKPOINT_NS, "")
 
@@ -641,18 +641,18 @@ def prepare_single_task(
         if name not in processes:
             return
         proc = processes[name]
-        version_type = type(next(iter(checkpoint["channel_versions"].values()), None))
+        versions = checkpoint["channel_versions"]
+        version_type = type(next(iter(versions.values()), None))
         null_version = version_type()  # type: ignore[misc]
         if null_version is None:
             return
-        seen = checkpoint["versions_seen"].get(name, {})
         # If any of the channels read by this process were updated
-        if triggers := sorted(
-            chan
-            for chan in proc.triggers
-            if channels[chan].get_catch() is not MISSING
-            and checkpoint["channel_versions"].get(chan, null_version)  # type: ignore[operator]
-            > seen.get(chan, null_version)
+        if triggers := _triggers(
+            channels,
+            versions,
+            checkpoint["versions_seen"].get(name),
+            null_version,
+            proc,
         ):
             try:
                 val = next(
@@ -758,6 +758,26 @@ def prepare_single_task(
                     )
             else:
                 return PregelTask(task_id, name, task_path[:3])
+
+
+def _triggers(
+    channels: Mapping[str, BaseChannel],
+    versions: ChannelVersions,
+    seen: Optional[ChannelVersions],
+    null_version: V,
+    proc: PregelNode,
+) -> Sequence[str]:
+    if seen is None:
+        for chan in proc.triggers:
+            if channels[chan].get_catch() is not MISSING:
+                return (chan,)
+    else:
+        for chan in proc.triggers:
+            if channels[chan].get_catch() is not MISSING and versions.get(
+                chan, null_version
+            ) > seen.get(chan, null_version):  # type: ignore[operator]
+                return (chan,)
+    return EMPTY_SEQ
 
 
 def _scratchpad(
